@@ -663,18 +663,35 @@ class wizlight:
         """Handle a syncPilot from the device."""
         self.history.message(HISTORY_PUSH, resp)
         self.last_push = time.monotonic()
-        old_state = self.state[0].pilotResult if self.state and self.state[0] else None
         new_state = resp["params"]
-        if old_state and states_match(old_state, new_state):
-            return
-        if self.bulbtype and self.bulbtype.features.dual_head:
-            # For dual head, push updates might be partial or ambiguous.
-            # We avoid corrupting the list-based state and force a refresh.
-            self.last_push = 0
+
+        # Dual-head: the bulb tags every syncPilot with `devices` (1-based head
+        # index). Route each push into its own slot instead of discarding it.
+        # (Confirmed by raw-protocol capture on HALO RL Dual Zone hardware.)
+        head_index = new_state.get("devices")
+        if (
+            self.bulbtype
+            and self.bulbtype.features.dual_head
+            and isinstance(head_index, int)
+            and head_index >= 1
+        ):
+            slot = head_index - 1
+            if self.state is None:
+                self.state = []
+            while len(self.state) <= slot:
+                self.state.append(None)
+            old_head = self.state[slot].pilotResult if self.state[slot] else None
+            if old_head and states_match(old_head, new_state):
+                return
+            self.state[slot] = PilotParser(new_state)
             if self.push_callback:
                 self.push_callback(self.state)
             return
 
+        # Single-head path (unchanged behavior).
+        old_state = self.state[0].pilotResult if self.state and self.state[0] else None
+        if old_state and states_match(old_state, new_state):
+            return
         self.state = [PilotParser(new_state)]
         if self.push_callback:
             self.push_callback(self.state)
@@ -911,14 +928,19 @@ class wizlight:
 
             new_state: List[Optional[PilotParser]] = []
             if self.bulbtype and self.bulbtype.features.dual_head:
-                for heads in range(2):
-                    method = {"method": "getPilot", "params": {"devices": heads}}
-                    resp = await self.send(method)
-                    if resp is not None and "result" in resp:
-                        head_state = PilotParser(resp["result"])
-                    else:
-                        head_state = None
-                    new_state.append(head_state)
+                # Per-head state cannot be polled: getPilot with a `devices`
+                # parameter errors on these devices. Real per-head state arrives
+                # via the syncPilot push (see _on_push). Here we only seed both
+                # slots from a single plain getPilot so entities are populated
+                # until the first push refines each head independently.
+                resp = await self.send({"method": "getPilot", "params": {}})
+                if resp is not None and "result" in resp:
+                    new_state = [
+                        PilotParser(resp["result"]),
+                        PilotParser(resp["result"]),
+                    ]
+                else:
+                    new_state = [None, None]
             # Without heads
             else:
                 resp = await self.send({"method": "getPilot", "params": {}})
